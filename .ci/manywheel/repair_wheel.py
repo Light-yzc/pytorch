@@ -141,7 +141,6 @@ ROCM_SO_FILES: list[str] = [
     "libhipsparse.so",
     "libhsa-runtime64.so",
     "libamd_comgr.so",
-    "libmagma.so",
     "librccl.so",
     "librocblas.so",
     "librocfft.so",
@@ -159,6 +158,14 @@ ROCM_SO_FILES: list[str] = [
     "libhsa-amd-aqlprofile64.so",
     "librocm-core.so",
     "librocroller.so",
+]
+
+# ROCm libs that are bundled only when present. MAGMA is built into the OS/tarball
+# ROCm images (/opt/rocm/magma) but is absent from the TheRock wheel layout, where
+# PyTorch is built with USE_MAGMA=0; treat it as optional so the wheel repair does
+# not hard-fail on the wheel-based (rocm7.14) build.
+ROCM_OPTIONAL_SO_FILES: list[str] = [
+    "libmagma.so",
 ]
 
 
@@ -238,9 +245,28 @@ def rocm_bundle(rocm_home: Path) -> tuple[list[BundledLib], list[AuxFile]]:
         # Strip the SO version: libfoo.so.6.1 -> libfoo.so. The ROCm-built
         # binaries in the wheel link against the bare .so SONAME.
         libs.append(BundledLib(src=path, dest_name=stem, needed_alias=stem))
+    # Optional libs (e.g. MAGMA): bundle when present, skip silently otherwise so
+    # the wheel-based ROCm layout (no MAGMA) does not hard-fail.
+    for stem in ROCM_OPTIONAL_SO_FILES:
+        path = find_rocm_lib(rocm_home, stem)
+        if path is not None:
+            libs.append(BundledLib(src=path, dest_name=stem, needed_alias=stem))
     for os_lib in rocm_os_deps():
         if os_lib.is_file():
             libs.append(BundledLib(src=os_lib, dest_name=os_lib.name))
+
+    # TheRock multi-arch wheels vendor their OS-side deps (libdrm, liblzma,
+    # libnuma, ...) under lib/rocm_sysdeps/lib and the ROCm libs reference them by
+    # their versioned soname. On the OS/tarball layout this dir is absent and
+    # those deps come from rocm_os_deps()/system paths instead, so this block is
+    # a no-op there.
+    sysdeps_lib = rocm_home / "lib" / "rocm_sysdeps" / "lib"
+    if sysdeps_lib.is_dir():
+        seen = {lib.dest_name for lib in libs}
+        for so in sorted(sysdeps_lib.glob("*.so*")):
+            if so.is_file() and not so.is_symlink() and so.name not in seen:
+                libs.append(BundledLib(src=so, dest_name=so.name))
+                seen.add(so.name)
 
     archs = rocm_arch_filter(os.environ.get("PYTORCH_ROCM_ARCH", ""))
     aux: list[AuxFile] = []
