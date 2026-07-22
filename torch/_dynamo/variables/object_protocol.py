@@ -14,37 +14,36 @@ import sys
 import types
 import typing
 from functools import lru_cache, partial
-from typing import NoReturn, TYPE_CHECKING
+from typing import TYPE_CHECKING, NoReturn
 
 import torch
 from torch._C._dynamo import (
-    get_type_slots,
-    has_slot,
     PyMappingSlots,
     PyNumberSlots,
     PySequenceSlots,
     PyTypeSlots,
+    get_type_slots,
+    has_slot,
 )
 
 from .. import graph_break_hints, polyfills, variables
 from ..exc import (
-    handle_observed_exception,
     ObservedTypeError,
+    UnhandledDescriptorError,
+    handle_observed_exception,
     raise_observed_exception,
     raise_type_error,
-    UnhandledDescriptorError,
     unimplemented,
 )
 from ..source import AttrSource, Source
 from ..utils import istype
 from .base import (
+    NO_SUCH_SUBOBJ,
     AsPythonConstantNotImplementedError,
     AttrMutationKind,
-    NO_SUCH_SUBOBJ,
     VariableTracker,
 )
 from .constant import ConstantVariable
-
 
 if TYPE_CHECKING:
     from ..symbolic_convert import InstructionTranslatorBase
@@ -359,7 +358,7 @@ def pyiter_send(
         return iter_.call_method(tx, "send", [arg], {})
 
 
-def vt_mapping_size(
+def pymapping_size(
     tx: "InstructionTranslatorBase", obj: "VariableTracker"
 ) -> "VariableTracker":
     # ref: https://github.com/python/cpython/blob/v3.13.3/Objects/abstract.c#L2308-L2330
@@ -373,7 +372,7 @@ def vt_mapping_size(
     raise_type_error(tx, f"object of type {obj.python_type_name()} has no len()")
 
 
-def generic_len(
+def generic_size(
     tx: "InstructionTranslatorBase", obj: "VariableTracker"
 ) -> "VariableTracker":
     # ref: https://github.com/python/cpython/blob/v3.13.3/Objects/abstract.c#L53-L69
@@ -385,10 +384,10 @@ def generic_len(
     T = maybe_get_python_type(obj)
     if type_implements_sq_length(T):
         return obj.sq_length(tx)
-    return vt_mapping_size(tx, obj)
+    return pymapping_size(tx, obj)
 
 
-def generic_bool(
+def generic_is_true(
     tx: "InstructionTranslatorBase", obj: VariableTracker
 ) -> VariableTracker:
     """Mirrors PyObject_IsTrue.
@@ -413,7 +412,7 @@ def generic_bool(
             return result
 
     try:
-        length = generic_len(tx, obj)
+        length = generic_size(tx, obj)
         from .tensor import SymNodeVariable
 
         if isinstance(length, SymNodeVariable):
@@ -502,7 +501,7 @@ def generic_str(
     return result
 
 
-def vt_getitem(
+def generic_getitem(
     tx: "InstructionTranslatorBase",
     obj: VariableTracker,
     key: VariableTracker,
@@ -531,7 +530,7 @@ def vt_getitem(
         key_type = maybe_get_python_type(key)
         if type_implements_nb_index(key_type):
             key = pynumber_as_ssize_t(tx, key, IndexError)
-            return vt_sequence_getitem(tx, obj, key)
+            return pysequence_getitem(tx, obj, key)
         raise_type_error(
             tx,
             f"{obj_type.__name__} indices must be integers, not {key_type.__name__}",
@@ -545,7 +544,7 @@ def vt_getitem(
     raise_type_error(tx, f"'{obj_type.__name__}' object is not subscriptable")
 
 
-def vt_sequence_getitem(
+def pysequence_getitem(
     tx: "InstructionTranslatorBase",
     obj: VariableTracker,
     index: VariableTracker,
@@ -578,7 +577,7 @@ def vt_sequence_getitem(
     raise_type_error(tx, f"'{obj.python_type_name()}' object does not support indexing")
 
 
-def vt_sequence_setitem(
+def pysequence_setitem(
     tx: "InstructionTranslatorBase",
     s: VariableTracker,
     i: VariableTracker,
@@ -619,7 +618,7 @@ def generic_setitem(
         key_type = maybe_get_python_type(key)
         if pyindex_check(key_type):
             key_value = pynumber_as_ssize_t(tx, key, err=IndexError)
-            return vt_sequence_setitem(tx, o, key_value, value)
+            return pysequence_setitem(tx, o, key_value, value)
         raise_type_error(
             tx, f"sequence index must be integer, not '{key.python_type_name()}'"
         )
@@ -628,7 +627,7 @@ def generic_setitem(
     )
 
 
-def sequence_delitem(
+def pysequence_delitem(
     tx: "InstructionTranslatorBase",
     s: VariableTracker,
     i: VariableTracker,
@@ -642,7 +641,7 @@ def sequence_delitem(
             if idx < 0:
                 if type_implements_sq_length(s_type):
                     length = s.sq_length(tx)
-                    i = generic_add(tx, i, length)
+                    i = pynumber_add(tx, i, length)
         return s.sq_ass_item_impl(tx, i, None)
 
     if type_implements_mp_ass_subscript(s_type):
@@ -667,7 +666,7 @@ def generic_delitem(
     key_type = maybe_get_python_type(key)
     if pyindex_check(key_type):
         key_value = key.nb_index_impl(tx)
-        return sequence_delitem(tx, o, key_value)
+        return pysequence_delitem(tx, o, key_value)
     elif type_implements_sq_ass_item(o_type):
         raise_type_error(
             tx, f"sequence index must be integer, not {key.python_type_name()}"
@@ -676,7 +675,7 @@ def generic_delitem(
     raise_type_error(tx, f"'{o.python_type_name()}' does not support item deletion")
 
 
-def generic_int(
+def pynumber_int(
     tx: "InstructionTranslatorBase", obj: VariableTracker
 ) -> VariableTracker:
     """Mirrors PyNumber_Long (int(x) dispatch).
@@ -718,7 +717,7 @@ def generic_int(
     )
 
 
-def generic_float(
+def pynumber_float(
     tx: "InstructionTranslatorBase", obj: VariableTracker
 ) -> VariableTracker:
     """Mirrors PyNumber_Float (float(x) dispatch).
@@ -840,7 +839,7 @@ def pynumber_index(
     return result
 
 
-def generic_iternext(
+def pyiter_next(
     tx: "InstructionTranslatorBase", obj: VariableTracker
 ) -> "VariableTracker":
     """
@@ -859,7 +858,7 @@ def generic_iternext(
     return obj.tp_iternext_impl(tx)
 
 
-def generic_neg(
+def pynumber_negative(
     tx: "InstructionTranslatorBase", obj: VariableTracker
 ) -> VariableTracker:
     """Mirrors PyNumber_Negative.
@@ -881,7 +880,7 @@ def generic_neg(
     )
 
 
-def generic_pos(
+def pynumber_positive(
     tx: "InstructionTranslatorBase", obj: VariableTracker
 ) -> VariableTracker:
     """Mirrors PyNumber_Positive.
@@ -903,7 +902,7 @@ def generic_pos(
     )
 
 
-def generic_abs(
+def pynumber_absolute(
     tx: "InstructionTranslatorBase", obj: VariableTracker
 ) -> VariableTracker:
     """Mirrors PyNumber_Absolute.
@@ -931,7 +930,7 @@ def vt_is_iterable(obj: VariableTracker) -> bool:
     return type_implements_tp_iter(T) or pysequence_check(T)
 
 
-def generic_invert(
+def pynumber_invert(
     tx: "InstructionTranslatorBase", obj: VariableTracker
 ) -> VariableTracker:
     """Mirrors PyNumber_Invert.
@@ -1275,7 +1274,7 @@ def binary_iop(
 
 
 # add / inplace add needs special handling
-def generic_add(
+def pynumber_add(
     tx: "InstructionTranslatorBase",
     v: VariableTracker,
     w: VariableTracker,
@@ -1292,7 +1291,7 @@ def generic_add(
     binop_type_error(tx, v, w, "+")
 
 
-def generic_inplace_add(
+def pynumber_inplace_add(
     tx: "InstructionTranslatorBase",
     v: VariableTracker,
     w: VariableTracker,
@@ -1323,12 +1322,12 @@ def generic_inplace_add(
 # ---------------------------------------------------------------------------
 
 
-def sequence_repeat(
+def pysequence_repeat(
     tx: "InstructionTranslatorBase",
     seq: VariableTracker,
     n: VariableTracker,
 ) -> VariableTracker:
-    """Mirrors CPython's sequence_repeat helper.
+    """Mirrors CPython's pysequence_repeat helper.
 
     Validates that ``n`` is index-like, converts it to an int, and dispatches
     to ``seq.sq_repeat_impl(tx, count)``.
@@ -1346,14 +1345,14 @@ def sequence_repeat(
     return seq.sq_repeat_impl(tx, count)
 
 
-def sequence_inplace_repeat(
+def pysequence_inplace_repeat(
     tx: "InstructionTranslatorBase",
     seq: VariableTracker,
     n: VariableTracker,
 ) -> VariableTracker:
-    """sequence_repeat using sq_inplace_repeat.
+    """pysequence_repeat using sq_inplace_repeat.
 
-    The validation step is identical to ``sequence_repeat``; only the
+    The validation step is identical to ``pysequence_repeat``; only the
     target slot differs.
     """
     n_type = maybe_get_python_type(n)
@@ -1380,7 +1379,7 @@ def validate_sequence_repeat_count(
         )
 
 
-def generic_multiply(
+def pynumber_multiply(
     tx: "InstructionTranslatorBase",
     v: VariableTracker,
     w: VariableTracker,
@@ -1399,9 +1398,9 @@ def generic_multiply(
     v_type = maybe_get_python_type(v)
     w_type = maybe_get_python_type(w)
     if type_implements_sq_repeat(v_type):
-        return sequence_repeat(tx, v, w)
+        return pysequence_repeat(tx, v, w)
     if type_implements_sq_repeat(w_type):
-        return sequence_repeat(tx, w, v)
+        return pysequence_repeat(tx, w, v)
 
     raise_type_error(
         tx,
@@ -1410,7 +1409,7 @@ def generic_multiply(
     )
 
 
-def generic_inplace_multiply(
+def pynumber_inplace_multiply(
     tx: "InstructionTranslatorBase",
     v: VariableTracker,
     w: VariableTracker,
@@ -1429,13 +1428,13 @@ def generic_inplace_multiply(
     v_type = maybe_get_python_type(v)
     w_type = maybe_get_python_type(w)
     if type_implements_sq_inplace_repeat(v_type):
-        return sequence_inplace_repeat(tx, v, w)
+        return pysequence_inplace_repeat(tx, v, w)
     if type_implements_sq_repeat(v_type):
-        return sequence_repeat(tx, v, w)
+        return pysequence_repeat(tx, v, w)
     # Cannot mutate w in-place — abstract.c L1348-1352 explicitly avoids
     # sq_inplace_repeat on the right-hand operand.
     if type_implements_sq_repeat(w_type):
-        return sequence_repeat(tx, w, v)
+        return pysequence_repeat(tx, w, v)
 
     raise_type_error(
         tx,
@@ -1444,7 +1443,7 @@ def generic_inplace_multiply(
     )
 
 
-def generic_matmul(
+def pynumber_matrix_multiply(
     tx: "InstructionTranslatorBase",
     v: VariableTracker,
     w: VariableTracker,
@@ -1453,7 +1452,7 @@ def generic_matmul(
     return binary_op(tx, v, w, "nb_matrix_multiply", "@")
 
 
-def generic_inplace_matmul(
+def pynumber_inplace_matrix_multiply(
     tx: "InstructionTranslatorBase",
     v: VariableTracker,
     w: VariableTracker,
@@ -1497,7 +1496,7 @@ def generic_inplace_matmul(
 # selection so that ``call_method`` routing for direct dunder calls
 # (``[1, 2].__mul__(3)``) reaches the correct slot.
 #
-# Distinct from ``generic_multiply`` / ``generic_inplace_multiply``, which
+# Distinct from ``pynumber_multiply`` / ``pynumber_inplace_multiply``, which
 # mirror the operator-level algorithm in ``Objects/abstract.c``
 # (``PyNumber_Multiply``) — cross-operand subclass priority and the
 # ``sq_repeat`` fallback when ``nb_multiply`` returns ``NotImplemented``.
@@ -1518,7 +1517,7 @@ def slot_wrapper_mul(
         # SQSLOT for __mul__ and __rmul__ both use ``wrap_indexargfunc`` —
         # the wrapper ignores the reverse flag because sq_repeat takes
         # ``(seq, count)`` regardless of which side ``self`` is on.
-        return sequence_repeat(tx, self, other)
+        return pysequence_repeat(tx, self, other)
     raise_type_error(
         tx,
         f"unsupported operand type(s) for *: "
@@ -1544,7 +1543,7 @@ def slot_wrapper_imul(
     if type_implements_nb_slot(self_type, PyNumberSlots.NB_INPLACE_MULTIPLY):
         return self.nb_inplace_multiply_impl(tx, other)
     if type_implements_sq_inplace_repeat(self_type):
-        return sequence_inplace_repeat(tx, self, other)
+        return pysequence_inplace_repeat(tx, self, other)
     return slot_wrapper_mul(tx, self, other)
 
 
@@ -1557,7 +1556,7 @@ def slot_wrapper_imul(
 #   IBSLOT  (__iadd__, nb_inplace_add, ...)                     [L10960]
 #   SQSLOT  (__iadd__, sq_inplace_concat, NULL, ...)            [L11031]
 #
-# Distinct from ``generic_add`` / ``generic_inplace_add``, which mirror the
+# Distinct from ``pynumber_add`` / ``pynumber_inplace_add``, which mirror the
 # operator-level ``PyNumber_Add`` (cross-operand priority, sq_concat fallback).
 # ---------------------------------------------------------------------------
 
@@ -1850,7 +1849,7 @@ def generic_hash(
     return ConstantVariable.create(h)
 
 
-def generic_contains(
+def pysequence_contains(
     tx: "InstructionTranslatorBase", obj: "VariableTracker", item: "VariableTracker"
 ) -> "VariableTracker":
     """
@@ -1977,7 +1976,7 @@ def generic_issubclass(
     result = cls.call_method(tx, "__subclasscheck__", [derived], {})
 
     # Coerce to bool (PyObject_IsTrue, abstract.c L2812).
-    return generic_bool(tx, result)
+    return generic_is_true(tx, result)
 
 
 # ── tp_getattro ──────────────────────────────────────────────────────
