@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import ast
+import functools
 import itertools
 import logging
 from collections.abc import Callable, Generator  # noqa: TC003
@@ -31,6 +33,74 @@ log = logging.getLogger(__name__)
 
 
 _ONES_ALPHA: dict = {}
+
+
+@functools.cache
+def _epilogue_signature(epilogue_fn) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    from cutlass.operators.fusion import trace_in_out
+
+    inputs, outputs = trace_in_out(epilogue_fn)
+    return (
+        tuple(name for name in inputs if name != "accum"),
+        tuple(outputs),
+    )
+
+
+def _epilogue_input_names(epilogue_fn) -> tuple[str, ...]:
+    return _epilogue_signature(epilogue_fn)[0]
+
+
+def _epilogue_tensors(args, attr: str) -> tuple:
+    epilogue = getattr(args, "epilogue", None)
+    tensors = (
+        ()
+        if epilogue is None
+        else tuple(
+            getattr(epilogue.tensors[name], attr)
+            for name in _epilogue_input_names(epilogue.epilogue_fn)
+        )
+    )
+    if len(tensors) > 4:
+        raise NotImplementedError("NVGEMM scaled epilogues support up to four inputs")
+    return tensors + (None,) * (4 - len(tensors))
+
+
+def _epilogue_tensor_kinds(args) -> tuple[int, ...]:
+    epilogue = getattr(args, "epilogue", None)
+    if epilogue is None:
+        return (0, 0, 0, 0)
+    kinds = []
+    for name in _epilogue_input_names(epilogue.epilogue_fn):
+        shape = epilogue.tensors[name].shape
+        if shape[-1] == 1 and (len(shape) == 1 or shape[-2] == 1):
+            raise NotImplementedError(
+                "NVGEMM scaled epilogues do not support scalar tensor inputs"
+            )
+        elif len(shape) == 1 or shape[-2] == 1:
+            kinds.append(2)
+        elif shape[-1] == 1:
+            kinds.append(3)
+        else:
+            kinds.append(1)
+    return tuple(kinds) + (0,) * (4 - len(kinds))
+
+
+def _epilogue_outputs(args, attr: str) -> tuple[tuple, int, int]:
+    epilogue = getattr(args, "epilogue", None)
+    if epilogue is None:
+        return (None, None, None), 1, 0
+    output_names = _epilogue_signature(epilogue.epilogue_fn)[1]
+    if not output_names or len(output_names) > 4:
+        raise NotImplementedError("NVGEMM scaled epilogues support 1-4 outputs")
+    if len(output_names) > 1 and "D" not in output_names:
+        raise NotImplementedError("NVGEMM scaled multi-store requires a D output")
+    primary_index = output_names.index("D") if "D" in output_names else 0
+    tensors = tuple(
+        getattr(epilogue.tensors[name], attr)
+        for index, name in enumerate(output_names)
+        if index != primary_index
+    )
+    return tensors + (None,) * (3 - len(tensors)), len(output_names), primary_index
 
 
 def _ones_alpha():
@@ -133,9 +203,21 @@ class VendoredDenseBlockScaledGemmKernel(CuteDslOperator):
         if getattr(args, "epilogue", None) is not None:
             epilogue_op = args.epilogue.epilogue_fn
             if isinstance(epilogue_op, str):
-                scope = {}
-                exec(epilogue_op, {}, scope)
-                epilogue_op = next(value for value in scope.values() if callable(value))
+                fn_name = next(
+                    node.name
+                    for node in ast.parse(epilogue_op).body
+                    if isinstance(node, ast.FunctionDef)
+                )
+                scope = {
+                    "relu": lambda x: cute.math.max(x, cute.full_like(x, 0.0))
+                }
+                exec(epilogue_op, scope)
+                epilogue_op = scope[fn_name]
+        epilogue_tensors = _epilogue_tensors(args, "compile_time_tensor")
+        epilogue_tensor_kinds = _epilogue_tensor_kinds(args)
+        epilogue_outputs, output_count, primary_output = _epilogue_outputs(
+            args, "compile_time_tensor"
+        )
         local_reduce_out = getattr(args, "local_reduce_out", None)
         if local_reduce_out is not None:
             return self.cute_compile(
@@ -148,11 +230,18 @@ class VendoredDenseBlockScaledGemmKernel(CuteDslOperator):
                 max_active_clusters,
                 stream,
                 epilogue_op,
+                self.metadata.operands.out.dtype,
                 alpha,
+                *epilogue_tensors,
+                *epilogue_tensor_kinds,
+                *epilogue_outputs,
+                output_count,
+                primary_output,
                 local_reduce_out.compile_time_tensor,
                 getattr(args, "local_reduce_group"),
                 getattr(args, "local_reduce_axis"),
                 getattr(args, "local_reduce_type"),
+                getattr(args, "local_reduce_source"),
                 target_sm=target_sm,
             )
         return self.cute_compile(
@@ -165,7 +254,13 @@ class VendoredDenseBlockScaledGemmKernel(CuteDslOperator):
             max_active_clusters,
             stream,
             epilogue_op,
+            self.metadata.operands.out.dtype,
             alpha,
+            *epilogue_tensors,
+            *epilogue_tensor_kinds,
+            *epilogue_outputs,
+            output_count,
+            primary_output,
             target_sm=target_sm,
         )
 
@@ -189,6 +284,8 @@ class VendoredDenseBlockScaledGemmKernel(CuteDslOperator):
         alpha = getattr(args, "alpha", None)
         if alpha is None:
             alpha = _ones_alpha()
+        epilogue_tensors = _epilogue_tensors(args, "runtime_tensor")
+        epilogue_outputs, _, _ = _epilogue_outputs(args, "runtime_tensor")
 
         local_reduce_out = getattr(args, "local_reduce_out", None)
         if local_reduce_out is not None:
@@ -201,6 +298,8 @@ class VendoredDenseBlockScaledGemmKernel(CuteDslOperator):
                 args.out.tensor,
                 stream,
                 alpha,
+                *epilogue_tensors,
+                *epilogue_outputs,
                 local_reduce_out.runtime_tensor,
             )
             return
@@ -214,6 +313,8 @@ class VendoredDenseBlockScaledGemmKernel(CuteDslOperator):
             args.out.tensor,
             stream,
             alpha,
+            *epilogue_tensors,
+            *epilogue_outputs,
             None,
         )
 
