@@ -7149,11 +7149,11 @@ def grouped_mm(
             shape ``(num_groups, K, N)``. If expert weights are stored in the standard
             ``nn.Linear`` layout ``(num_groups, N, K)``, pass
             ``weight.transpose(-2, -1)`` as ``mat_b``.
-        offs: Optional 1D tensor of monotonically increasing ``int32`` offsets that
-            delimit the jagged dimension of any 2D operand. ``offs[i]`` marks the end
-            of group ``i`` and ``offs[-1]`` must be strictly less than the total
-            length of that operand's sliced dimension; elements beyond ``offs[-1]``
-            are ignored.
+        offs: Optional 1D tensor of monotonically increasing ``int32``
+            offsets delimiting the jagged dimension of any 2D operand.
+            ``offs[i]`` marks the end of group ``i``. ``offs[-1]`` must be less
+            than or equal to the total length of the operand's sliced dimension.
+            Elements beyond ``offs[-1]`` are ignored.
         bias: Optional tensor that is added to the grouped outputs. Bias is not
             jagged and must be broadcastable to the result shape of each group.
         out_dtype: Optional dtype that controls the accumulation/output dtype.
@@ -7163,6 +7163,21 @@ def grouped_mm(
     Returns:
         A tensor containing the concatenated results of each per-group GEMM with
         shape inferred from the operands and ``offs``.
+
+    Examples::
+        >>> # xdoctest: +REQUIRES(env:TORCH_DOCTEST_CUDA)
+        >>> mat_a = torch.randn(
+        ...     32, 64, device="cuda", dtype=torch.bfloat16
+        ... )
+        >>> weight = torch.randn(
+        ...     2, 32, 64, device="cuda", dtype=torch.bfloat16
+        ... )
+        >>> offs = torch.tensor([16, 32], device="cuda", dtype=torch.int32)
+        >>> mat_b = weight.transpose(-2, -1)
+        >>> mat_b.shape
+        torch.Size([2, 64, 32])
+        >>> F.grouped_mm(mat_a, mat_b, offs=offs).shape
+        torch.Size([32, 32])
     """
 
     return torch._grouped_mm(mat_a, mat_b, offs=offs, bias=bias, out_dtype=out_dtype)
