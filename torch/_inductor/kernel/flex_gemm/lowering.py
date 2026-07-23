@@ -33,6 +33,7 @@ from .constraints import (
     LOCAL_REDUCE_DENSE_MM_SCOPE_ERROR,
     LOCAL_REDUCE_PARTIAL_OUTPUT_CONTRACT_ERROR,
     statically_known,
+    statically_known_multiple,
     statically_known_shape_equal,
     validate_flex_gemm_local_reduce_config,
 )
@@ -132,18 +133,29 @@ def validate_flex_gemm_aux_outputs(
 
 
 def allocate_flex_gemm_aux_outs(
-    aux_metas: tuple[Any, ...], mat1: TensorBox
+    aux_metas: tuple[Any, ...],
+    mat1: TensorBox,
+    *,
+    column_major: bool = False,
 ) -> tuple[TensorBox, ...]:
-    """Allocate same-shape aux output buffers beside the main GEMM output."""
-    return tuple(
-        empty_strided(
-            ir.convert_shape_to_inductor(aux_meta.shape),
-            ir.convert_shape_to_inductor(aux_meta.stride()),
-            dtype=aux_meta.dtype,
-            device=mat1.get_device_or_error(),
+    """Allocate aux output buffers in their logical matrix orientation."""
+    outs = []
+    for aux_meta in aux_metas:
+        size = ir.convert_shape_to_inductor(aux_meta.shape)
+        stride = (
+            [1, size[-2]]
+            if column_major
+            else ir.convert_shape_to_inductor(aux_meta.stride())
         )
-        for aux_meta in aux_metas
-    )
+        outs.append(
+            empty_strided(
+                size,
+                stride,
+                dtype=aux_meta.dtype,
+                device=mat1.get_device_or_error(),
+            )
+        )
+    return tuple(outs)
 
 
 def flex_gemm_ordered_outputs(result, aux_outs, local_reduce_outs, local_reduce_index):
@@ -188,6 +200,11 @@ def flex_gemm_autotune_view_input(node: ir.ReinterpretView) -> torch.Tensor:
     return torch.as_strided(base, sizes, strides, offset)
 
 
+def explicit_config_swaps_ab(explicit_config: dict[str, Any] | None) -> bool:
+    """Return whether every explicitly constrained candidate uses swap-ab."""
+    return explicit_config is not None and explicit_config.get("swap_ab") is True
+
+
 def flex_gemm_config_keys(
     device,
     m: int,
@@ -196,6 +213,7 @@ def flex_gemm_config_keys(
     tuned: bool,
     main_transform: FlexGemmGroupedMainOutputTransform | None = None,
     explicit_config: dict[str, Any] | None = None,
+    swap_ab_alignment: int = 1,
 ) -> tuple[tuple[Any, ...], ...]:
     """Select QuACK config keys after applying grouped-layout config constraints.
 
@@ -239,12 +257,26 @@ def flex_gemm_config_keys(
         if explicit_config is None
         else explicit_gemm_configs_for_device(explicit_config, device)
     )
+    candidate_configs = tuple(
+        config
+        for config in candidate_configs
+        if not config.swap_ab or statically_known_multiple(n, swap_ab_alignment)
+    )
+    if not candidate_configs:
+        raise NotImplementedError(
+            "FlexGEMM explicit QUACK swap_ab constraints require output N "
+            f"divisible by {swap_ab_alignment}"
+        )
+    allow_local_reduce_swap_ab = explicit_config_swaps_ab(explicit_config)
     if not tuned:
         default_key = default_gemm_config_key(device, m, n, candidate_configs)
         default_config = gemm_config_from_key(default_key)
         if all(
             validate_flex_gemm_local_reduce_config(
-                default_config, geometry.group, geometry.axis
+                default_config,
+                geometry.group,
+                geometry.axis,
+                allow_swap_ab=allow_local_reduce_swap_ab,
             )
             for geometry in local_reduce_geometries
         ) and (main_transform is None or fits_main_output(default_config)):
@@ -270,7 +302,10 @@ def flex_gemm_config_keys(
             config
             for config in configs
             if validate_flex_gemm_local_reduce_config(
-                config, geometry.group, geometry.axis
+                config,
+                geometry.group,
+                geometry.axis,
+                allow_swap_ab=allow_local_reduce_swap_ab,
             )
         )
         if not configs:
@@ -435,6 +470,16 @@ def lower_quack_flex_gemm(gemm_op, subgraph, args, gemm_kwargs, kernel_options):
         logical_output_size,
         ir.convert_shape_to_inductor(output_meta.stride()),
     )
+    explicit_swap_ab = explicit_config_swaps_ab(explicit_config)
+    swap_ab_alignment = max(
+        16 // dtype.itemsize
+        for dtype in (
+            output_meta.dtype,
+            *(arg.get_dtype() for arg in gemm_args),
+            *(arg.get_dtype() for arg in epilogue_args),
+            *(aux_meta.dtype for aux_meta in aux_metas),
+        )
+    )
     gemm_input_nodes = [
         ir.TemplateBuffer.realize_template_input(arg) for arg in gemm_args
     ]
@@ -443,7 +488,9 @@ def lower_quack_flex_gemm(gemm_op, subgraph, args, gemm_kwargs, kernel_options):
     ]
     aux_outs = allocate_flex_gemm_aux_outs(aux_metas, gemm_args[mat1_index])
     local_reduce_outs = allocate_flex_gemm_aux_outs(
-        local_reduce_metas, gemm_args[mat1_index]
+        local_reduce_metas,
+        gemm_args[mat1_index],
+        column_major=explicit_swap_ab,
     )
     aux_input_nodes = [
         ir.TemplateBuffer.realize_template_input(aux_out) for aux_out in aux_outs
@@ -476,6 +523,7 @@ def lower_quack_flex_gemm(gemm_op, subgraph, args, gemm_kwargs, kernel_options):
         epilogue_analysis,
         epilogue_arg_placeholders,
         fast_math=fast_math,
+        swap_ab=explicit_swap_ab,
     )
     quack_config_keys = flex_gemm_config_keys(
         layout.device,
@@ -485,6 +533,7 @@ def lower_quack_flex_gemm(gemm_op, subgraph, args, gemm_kwargs, kernel_options):
         tuned,
         main_transform,
         explicit_config,
+        swap_ab_alignment=swap_ab_alignment,
     )
     epilogue_arg_indices = tuple(
         range(
